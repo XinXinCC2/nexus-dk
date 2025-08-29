@@ -1,396 +1,373 @@
 #!/bin/bash
 set -e
 
+# ✅ 全局配置变量
+DEFAULT_THREADS=8
+NEXUS_START_FLAGS="--headless --max-threads $DEFAULT_THREADS"
+BASE_DIR="/root/nexus-node"
 IMAGE_NAME="nexus-node:latest"
-BUILD_DIR="/root/nexus-docker"
-LOG_DIR="/var/log/nexus"  # 集中管理日志的目录
+BUILD_DIR="$BASE_DIR/build"
+LOG_DIR="$BASE_DIR/logs"
+CONFIG_DIR="$BASE_DIR/config"
+
+# ✅ 检查是否安装 jq
+command -v jq >/dev/null 2>&1 || {
+    echo "❌ 缺少 jq 命令，请先安装：sudo apt install -y jq" >&2
+    exit 1
+}
+
+# ✅ 优化目录权限
+function init_dirs() {
+    mkdir -p "$BUILD_DIR" "$LOG_DIR" "$CONFIG_DIR"
+    chmod 755 "$LOG_DIR"
+    sudo chown -R $USER:$USER "$BASE_DIR" 2>/dev/null || true
+}
 
 function check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
+    if ! [ -x "$(command -v docker)" ]; then
         echo "Docker 未安装，正在安装..."
         apt update
         apt install -y apt-transport-https ca-certificates curl software-properties-common
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
         add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-        apt update
-        apt install -y docker-ce
-        systemctl enable docker
-        systemctl start docker
-    fi
-}
-
-function init_log_dir() {
-    # 创建日志目录并设置适当权限
-    mkdir -p "$LOG_DIR"
-    chmod 755 "$LOG_DIR"
-    if [ ! -w "$LOG_DIR" ]; then
-        echo "❌ 无法写入日志目录 $LOG_DIR，请检查权限"
-        return 1
+        apt update && apt install -y docker-ce
+        systemctl enable docker && systemctl start docker
     fi
 }
 
 function prepare_build_files() {
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR"
+  mkdir -p "$BUILD_DIR"
 
-    cat > Dockerfile <<EOF
-FROM ubuntu:24.04
+  cat > "$BUILD_DIR/Dockerfile" <<'EOF'
+FROM alpine:3.22.0
 
-ENV DEBIAN_FRONTEND=noninteractive
+# 安装运行依赖
+RUN apk add --no-cache bash curl ca-certificates libc6-compat libgcc libstdc++
 
-RUN apt-get update && apt-get install -y \\
-    curl \\
-    screen \\
-    cron \\
-    bash \\
-    jq \\
-    logrotate \\
-    && rm -rf /var/lib/apt/lists/*
+# 下载并安装 nexus-cli
+RUN curl -sSf https://cli.nexus.xyz/ -o /tmp/install.sh && \
+    chmod +x /tmp/install.sh && \
+    NONINTERACTIVE=1 /tmp/install.sh && \
+    rm -f /tmp/install.sh
 
-RUN curl -sSL https://cli.nexus.xyz/ | bash && \\
-    cp /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network && \\
-    chmod +x /usr/local/bin/nexus-network
+RUN cp /root/.nexus/bin/nexus-cli /usr/local/bin/ && \
+    chmod +x /usr/local/bin/nexus-cli
 
+# 默认工作目录
+WORKDIR /nexus
+
+# 入口脚本
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-# 添加日志轮转配置
-COPY nexus-logrotate /etc/logrotate.d/nexus
 
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    cat > entrypoint.sh <<'EOF'
+  cat > "$BUILD_DIR/entrypoint.sh" <<'EOF'
 #!/bin/bash
 set -e
 
-PROVER_ID_FILE="/root/.nexus/node-id"
-LOG_FILE="/var/log/nexus/nexus.log"
+case "$1" in
+    --version|--help|version|help)
+        exec nexus-cli "$@"
+        ;;
+esac
 
-# 确保日志目录和文件存在且可写
-mkdir -p "$(dirname "$PROVER_ID_FILE")" "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE" && chmod 644 "$LOG_FILE"
+: "${NODE_ID:?❌ 必须设置 NODE_ID 环境变量}"
+: "${MAX_THREADS:=8}"
 
-echo "$NODE_ID" > "$PROVER_ID_FILE"
-echo "使用的 node-id: $NODE_ID"
+LOG_DIR="/nexus-data"
+LOG_FILE="${LOG_DIR}/nexus-${NODE_ID}.log"
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
 
-[ -n "$NEXUS_LOG" ] && LOG_FILE="$NEXUS_LOG"
-[ -n "$SCREEN_NAME" ] || SCREEN_NAME="nexus"
+echo "▶️ 启动节点: $NODE_ID | 线程数: $MAX_THREADS | 日志文件: $LOG_FILE"
 
-if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "nexus-network 未安装"
-    exit 1
-fi
-
-screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
-
-echo "启动 nexus-network..."
-screen -dmS "$SCREEN_NAME" bash -c "nexus-network start --node-id $NODE_ID &>> $LOG_FILE"
-
-sleep 3
-
-if screen -list | grep -q "$SCREEN_NAME"; then
-    echo "实例 [$SCREEN_NAME] 已启动，日志文件：$LOG_FILE"
-else
-    echo "启动失败：$SCREEN_NAME"
-    cat "$LOG_FILE"
-    exit 1
-fi
-
-tail -f "$LOG_FILE"
+exec nexus-cli start \
+    --node-id "$NODE_ID" \
+    --max-threads "$MAX_THREADS" \
+    --headless \
+    2>&1 | tee -a "$LOG_FILE"
 EOF
 
-    # 添加日志轮转配置
-    cat > nexus-logrotate <<'EOF'
-/var/log/nexus/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    copytruncate
-}
-EOF
+  chmod +x "$BUILD_DIR/entrypoint.sh"
 }
 
+# ✅ 增加镜像存在检查
 function build_image() {
     cd "$BUILD_DIR"
-    if ! docker build -t "$IMAGE_NAME" .; then
-        echo "❌ 镜像构建失败"
-        return 1
+    if docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        read -rp "镜像已存在，是否重新构建？[y/N] " choice
+        [[ "$choice" != [yY] ]] && return
     fi
+
+    echo "🔧 开始构建 Docker 镜像..."
+    docker build --no-cache -t "$IMAGE_NAME" . || {
+        echo "❌ 镜像构建失败" >&2
+        exit 1
+    }
+
+    echo "✅ 镜像构建完成，版本信息："
+    docker run --rm --entrypoint nexus-cli "$IMAGE_NAME" --version || {
+        echo "⚠️ 版本检查失败" >&2
+    }
 }
 
-function prepare_log_file() {
-    local log_file="$1"
-    
-    if [ -d "$log_file" ]; then
-        echo "⚠️ $log_file 是目录，正在删除并重新创建为空日志文件..."
-        rm -rf "$log_file"
-    fi
-    
-    touch "$log_file" && chmod 644 "$log_file"
-    if [ $? -ne 0 ]; then
-        echo "❌ 无法创建日志文件 $log_file，请检查权限"
-        return 1
-    fi
+function build_image_latest() {
+    cd "$BUILD_DIR"
+    echo "🔧 正在更新到官方最新版..."
+    docker build -t "$IMAGE_NAME" . || {
+        echo "❌ 镜像构建失败" >&2
+        exit 1
+    }
+    echo "✅ 镜像更新完成，当前版本："
+    docker run --rm --entrypoint nexus-cli "$IMAGE_NAME" --version
 }
 
+function validate_node_id() {
+    [[ "$1" =~ ^[0-9]+$ ]] || {
+        echo "❌ node-id 必须是数字" >&2
+        return 1
+    }
+    return 0
+}
+
+# ✅ 使用全局启动参数
 function start_instances() {
     read -rp "请输入要创建的实例数量: " INSTANCE_COUNT
-    if ! [[ "$INSTANCE_COUNT" =~ ^[0-9]+$ ]] || [ "$INSTANCE_COUNT" -lt 1 ]; then
-        echo "无效数量。请输入正整数。"
-        return 1
-    fi
-
-    init_log_dir || return 1
+    [[ "$INSTANCE_COUNT" =~ ^[0-9]+$ ]] || { echo "❌ 请输入有效数字"; exit 1; }
 
     for i in $(seq 1 "$INSTANCE_COUNT"); do
-        read -rp "请输入第 $i 个实例的 node-id: " NODE_ID
-        [ -z "$NODE_ID" ] && echo "❌ node-id 不能为空" && continue
-        
-        CONTAINER_NAME="nexus-node-$i"
-        LOG_FILE="$LOG_DIR/nexus-$i.log"
-        SCREEN_NAME="nexus-$i"
+        while true; do
+            read -rp "请输入第 $i 个实例的 node-id: " NODE_ID
+            validate_node_id "$NODE_ID" && break
+        done
 
-        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        # ✅ 增强版冲突检查
+        if docker inspect "nexus-node-$i" &>/dev/null; then
+            read -rp "容器 nexus-node-$i 已存在，是否替换？[y/N] " choice
+            if [[ "$choice" =~ ^[yY] ]]; then
+                echo "🔄 正在移除旧容器..."
+                docker rm -f "nexus-node-$i" || {
+                    echo "❌ 容器删除失败，跳过此实例"
+                    continue
+                }
+            else
+                echo "⏩ 跳过实例 nexus-node-$i"
+                continue
+            fi
+        fi
 
-        prepare_log_file "$LOG_FILE" || continue
-
-        if ! docker run -d \
-            --name "$CONTAINER_NAME" \
+        # 启动新实例
+        if ! docker run -dit \
+            --name "nexus-node-$i" \
             -e NODE_ID="$NODE_ID" \
-            -e NEXUS_LOG="$LOG_FILE" \
-            -e SCREEN_NAME="$SCREEN_NAME" \
-            -v "$LOG_FILE":"$LOG_FILE" \
-            -v "$LOG_DIR":"$LOG_DIR" \
-            "$IMAGE_NAME"; then
-            echo "❌ 启动容器 $CONTAINER_NAME 失败"
+            -v "$LOG_DIR":/nexus-data \
+            "$IMAGE_NAME" \
+            start --node-id "$NODE_ID" --max-threads 8 --headless; then
+            echo "❌ 实例 nexus-node-$i 启动失败"
             continue
         fi
 
-        echo "✅ 启动成功：$CONTAINER_NAME"
-        echo "日志文件路径: $LOG_FILE"
+        echo "✅ 实例 nexus-node-$i 启动成功 (node-id: $NODE_ID)"
     done
-}
-
-function stop_all_instances() {
-    echo "🛑 停止所有 Nexus 实例..."
-    docker ps -a --format '{{.Names}}' | grep '^nexus-node-' | while read -r name; do
-        docker rm -f "$name" >/dev/null 2>&1 && echo "停止 $name"
-    done
-}
-
-function restart_instance() {
-    read -rp "请输入实例编号（如 2 表示 nexus-node-2）: " idx
-    CONTAINER_NAME="nexus-node-$idx"
-    LOG_FILE="$LOG_DIR/nexus-$idx.log"
-    SCREEN_NAME="nexus-$idx"
-
-    NODE_ID=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep NODE_ID= | cut -d= -f2)
-    [ -z "$NODE_ID" ] && echo "❌ 未找到实例或 ID" && return 1
-
-    prepare_log_file "$LOG_FILE" || return 1
-
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
-    if ! docker run -d \
-        --name "$CONTAINER_NAME" \
-        -e NODE_ID="$NODE_ID" \
-        -e NEXUS_LOG="$LOG_FILE" \
-        -e SCREEN_NAME="$SCREEN_NAME" \
-        -v "$LOG_FILE":"$LOG_FILE" \
-        -v "$LOG_DIR":"$LOG_DIR" \
-        "$IMAGE_NAME"; then
-        echo "❌ 重启容器 $CONTAINER_NAME 失败"
-        return 1
-    fi
-
-    echo "✅ 已重启：$CONTAINER_NAME"
-}
-
-function change_node_id() {
-    read -rp "请输入要更换的实例编号: " idx
-    read -rp "请输入新的 node-id: " NEW_ID
-    [ -z "$NEW_ID" ] && echo "❌ node-id 不能为空" && return 1
-
-    CONTAINER_NAME="nexus-node-$idx"
-    LOG_FILE="$LOG_DIR/nexus-$idx.log"
-    SCREEN_NAME="nexus-$idx"
-
-    prepare_log_file "$LOG_FILE" || return 1
-
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
-    if ! docker run -d \
-        --name "$CONTAINER_NAME" \
-        -e NODE_ID="$NEW_ID" \
-        -e NEXUS_LOG="$LOG_FILE" \
-        -e SCREEN_NAME="$SCREEN_NAME" \
-        -v "$LOG_FILE":"$LOG_FILE" \
-        -v "$LOG_DIR":"$LOG_DIR" \
-        "$IMAGE_NAME"; then
-        echo "❌ 启动容器 $CONTAINER_NAME 失败"
-        return 1
-    fi
-
-    echo "✅ 实例 $CONTAINER_NAME 已使用新 ID 启动"
 }
 
 function add_one_instance() {
-    NEXT_NUM=1
-    while docker ps -a --format '{{.Names}}' | grep -qw "nexus-node-$NEXT_NUM"; do
-        ((NEXT_NUM++))
+    # 获取最大编号（兼容非数字容器名）
+    MAX_ID=$(docker ps --filter "name=nexus-node-" --format '{{.Names}}' |
+             awk -F'-' '{if($NF ~ /^[0-9]+$/) print $NF}' |
+             sort -n |
+             tail -n 1)
+
+    # 计算下一个可用编号
+    NEXT_IDX=$(( ${MAX_ID:-0} + 1 ))
+
+    while true; do
+        read -rp "请输入 node-id (必须为数字): " NODE_ID
+        [[ "$NODE_ID" =~ ^[0-9]+$ ]] && break
+        echo "❌ node-id 必须是数字！"
     done
 
-    read -rp "请输入新实例的 node-id: " NODE_ID
-    [ -z "$NODE_ID" ] && echo "❌ node-id 不能为空" && return 1
-    
-    CONTAINER_NAME="nexus-node-$NEXT_NUM"
-    LOG_FILE="$LOG_DIR/nexus-$NEXT_NUM.log"
-    SCREEN_NAME="nexus-$NEXT_NUM"
-
-    init_log_dir || return 1
-    prepare_log_file "$LOG_FILE" || return 1
-
-    if ! docker run -d \
-        --name "$CONTAINER_NAME" \
+    # 启动实例
+    docker run -dit \
+        --name "nexus-node-${NEXT_IDX}" \
         -e NODE_ID="$NODE_ID" \
-        -e NEXUS_LOG="$LOG_FILE" \
-        -e SCREEN_NAME="$SCREEN_NAME" \
-        -v "$LOG_FILE":"$LOG_FILE" \
-        -v "$LOG_DIR":"$LOG_DIR" \
-        "$IMAGE_NAME"; then
-        echo "❌ 启动容器 $CONTAINER_NAME 失败"
-        return 1
+        -v "$LOG_DIR":/nexus-data \
+        "$IMAGE_NAME" \
+        start --node-id "$NODE_ID" --max-threads 8 --headless
+
+    echo "✅ 实例 nexus-node-${NEXT_IDX} 启动成功（线程数:8）"
+}
+
+function restart_node() {
+    containers=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nexus-node-[0-9]+$ ]]; then
+            containers+=("$line")
+        fi
+    done < <(docker ps --filter "name=nexus-node-" --format "{{.Names}}")
+
+    if [ ${#containers[@]} -eq 0 ]; then
+        echo "⚠️ 没有运行中的实例"
+        sleep 2
+        return
     fi
 
-    echo "✅ 添加实例成功：$CONTAINER_NAME"
-    echo "日志文件路径: $LOG_FILE"
-}
-
-function view_logs() {
-    read -rp "请输入实例编号: " idx
-    LOG_FILE="$LOG_DIR/nexus-$idx.log"
-    [ ! -f "$LOG_FILE" ] && echo "❌ 日志不存在" && return 1
-    tail -f "$LOG_FILE"
-}
-
-function show_running_ids() {
-    echo "📋 当前正在运行的实例及 ID："
-    docker ps --format '{{.Names}}' | grep '^nexus-node-' | while read -r name; do
-        ID=$(docker exec "$name" cat /root/.nexus/node-id 2>/dev/null || echo "无法获取ID")
-        echo "$name: $ID"
+    echo "请选择要重启的节点:"
+    for i in "${!containers[@]}"; do
+        echo "[$((i+1))] ${containers[i]}"
     done
+    echo "[a] 重启所有节点"
+    echo "[0] 返回"
+
+    read -rp "请输入选择: " choice
+    case "$choice" in
+        [1-9])
+            if [ "$choice" -le "${#containers[@]}" ]; then
+                container="${containers[$((choice-1))]}"
+                echo "🔄 正在重启 $container ..."
+                if ! timeout 10s docker restart "$container"; then
+                    echo "❌ 重启超时，尝试强制停止..."
+                    docker stop -t 2 "$container" && docker start "$container"
+                fi
+            fi
+            ;;
+        a|A)
+            for container in "${containers[@]}"; do
+                echo "🔄 正在重启 $container ..."
+                if ! timeout 10s docker restart "$container"; then
+                    echo "❌ $container 重启超时，尝试强制停止..."
+                    docker stop -t 2 "$container" && docker start "$container"
+                fi
+            done
+            ;;
+    esac
+    read -rp "按 Enter 继续..."
 }
+function calculate_uptime() {
+    local container=$1
+    local created=$(docker inspect --format '{{.Created}}' "$container")
+    local restarts=$(docker inspect --format '{{.RestartCount}}' "$container")
+    local started=$(docker inspect --format '{{.State.StartedAt}}' "$container")
 
-function setup_rotation_schedule() {
-    echo "📦 正在部署 ID 自动轮换配置..."
-    init_log_dir || return 1
+    local now=$(date +%s)
+    local created_ts=$(date -d "$created" +%s)
+    local started_ts=$(date -d "$started" +%s)
 
-    # 检查配置文件是否已存在，避免覆盖
-    if [ -f "/root/nexus-id-config.json" ]; then
-        echo "⚠️ 配置文件 /root/nexus-id-config.json 已存在，将使用现有配置"
+    if [ "$restarts" -gt 0 ]; then
+        local prev_uptime=$((created_ts - started_ts))
+        local curr_uptime=$((now - started_ts))
+        local total_seconds=$((prev_uptime + curr_uptime))
     else
-        # 创建空的配置文件模板，让用户自己填写
-        cat > /root/nexus-id-config.json <<'EOF'
-{
-  "nexus-node-1": ["请替换为您的node-id列表"],
-  "nexus-node-2": ["请替换为您的node-id列表"]
-}
-EOF
-        echo "✅ 已创建配置文件模板 /root/nexus-id-config.json"
-        echo "请编辑此文件，替换为您自己的 node-id 列表"
+        local total_seconds=$((now - started_ts))
     fi
 
-    # 初始化状态文件（如果不存在）
-    if [ ! -f "/root/nexus-id-state.json" ]; then
-        cat > /root/nexus-id-state.json <<'EOF'
-{
-  "nexus-node-1": 0,
-  "nexus-node-2": 0
+    local hours=$((total_seconds / 3600))
+    local minutes=$(( (total_seconds % 3600) / 60 ))
+    printf "%02d时%02dm" "$hours" "$minutes"
 }
-EOF
-        echo "✅ 已初始化状态文件 /root/nexus-id-state.json"
-    fi
+function show_container_logs() {
+    containers=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nexus-node-[0-9]+$ ]]; then
+            containers+=("$line")
+        fi
+    done < <(docker ps --filter "name=nexus-node-" --format "{{.Names}}")
 
-    # 写入轮换脚本
-    cat > /root/nexus-rotate.sh <<'EOS'
-#!/bin/bash
-CONFIG=/root/nexus-id-config.json
-STATE=/root/nexus-id-state.json
-LOG_DIR="/var/log/nexus"
+    while true; do
+        clear
+        echo "Nexus 节点日志查看"
+        echo "--------------------------------"
 
-function get_next_index() {
-    local current=$1
-    local max=$2
-    echo $(((current + 1) % max))
-}
+        if [ ${#containers[@]} -eq 0 ]; then
+            echo "⚠️ 没有运行中的实例"
+            sleep 2
+            return
+        fi
 
-[ ! -f "$STATE" ] && echo "❌ 状态文件不存在" && exit 1
-[ ! -f "$CONFIG" ] && echo "❌ 配置文件不存在" && exit 1
+        for i in "${!containers[@]}"; do
+            status=$(docker inspect -f '{{.State.Status}}' "${containers[i]}")
+            node_id=$(docker inspect "${containers[i]}" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep "^NODE_ID=" | cut -d= -f2)
+            echo "[$((i+1))] ${containers[i]} (状态: $status | 节点ID: ${node_id:-未设置})"
+        done
 
-for INSTANCE in $(jq -r 'keys[]' "$CONFIG"); do
-    IDS=($(jq -r ".\"$INSTANCE\"[]" "$CONFIG"))
-    [ ${#IDS[@]} -eq 0 ] && continue
-    
-    CURRENT_INDEX=$(jq -r ".\"$INSTANCE\"" "$STATE")
-    NEXT_INDEX=$(get_next_index "$CURRENT_INDEX" "${#IDS[@]}")
-    NEW_ID=${IDS[$NEXT_INDEX]}
+        echo
+        echo "[0] 返回主菜单"
+        read -rp "请选择容器: " input
 
-    echo "[$(date)] $INSTANCE 使用新的 node-id: $NEW_ID"
-
-    docker rm -f "$INSTANCE" >/dev/null 2>&1
-    docker run -d \
-        --name "$INSTANCE" \
-        -e NODE_ID="$NEW_ID" \
-        -e NEXUS_LOG="$LOG_DIR/${INSTANCE//nexus-node-/nexus-}.log" \
-        -e SCREEN_NAME="${INSTANCE//nexus-node-/nexus-}" \
-        -v "$LOG_DIR/${INSTANCE//nexus-node-/nexus-}.log":"$LOG_DIR/${INSTANCE//nexus-node-/nexus-}.log" \
-        -v "$LOG_DIR":"$LOG_DIR" \
-        nexus-node:latest
-
-    jq ".\"$INSTANCE\" = $NEXT_INDEX" "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
-done
-EOS
-
-    chmod +x /root/nexus-rotate.sh
-
-    # 加入 crontab，每 2 小时执行一次
-    (crontab -l 2>/dev/null; echo "0 */2 * * * /root/nexus-rotate.sh >> /var/log/nexus/nexus-rotate.log 2>&1") | crontab -
-
-    echo "✅ 自动轮换计划已部署！每 2 小时轮换一次 node-id"
-    echo "请确保已正确编辑 /root/nexus-id-config.json 文件"
+        [[ "$input" == "0" ]] && return
+        [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -le "${#containers[@]}" ] && {
+            container="${containers[$((input-1))]}"
+            clear
+            echo "🔍 实时日志: $container (Ctrl+C 退出)"
+            echo "--------------------------------"
+            trap "echo; return 0" SIGINT
+            docker logs -f --tail=20 "$container"
+            trap - SIGINT
+            read -rp "按 Enter 继续..."
+        }
+    done
 }
 
 function show_menu() {
-    while true; do
-        echo ""
-        echo "=========== Nexus 节点管理 ==========="
-        echo "1. 构建并启动新实例"
-        echo "2. 停止所有实例"
-        echo "3. 重启指定实例"
-        echo "4. 查看运行中的实例及 ID"
-        echo "5. 退出"
-        echo "6. 更换某个实例的 node-id（并自动重启）"
-        echo "7. 添加一个新实例"
-        echo "8. 查看指定实例日志"
-        echo "9. 一键部署自动 ID 轮换计划（每 2 小时）"
-        echo "======================================"
-        read -rp "请选择操作 (1-9): " choice
-        case "$choice" in
-            1) check_docker; prepare_build_files; build_image && start_instances ;;
-            2) stop_all_instances ;;
-            3) restart_instance ;;
-            4) show_running_ids ;;
-            5) echo "退出"; exit 0 ;;
-            6) change_node_id ;;
-            7) add_one_instance ;;
-            8) view_logs ;;
-            9) setup_rotation_schedule ;;
-            *) echo "无效选项，请输入 1-9" ;;
-        esac
-    done
+    clear
+    # 绿色NEXUS标题（清晰版）
+    echo -e "${GREEN}"
+    echo "  N   N  EEEEE  X   X  U   U  SSSSS"
+    echo "  NN  N  E       X X   U   U  S    "
+    echo "  N N N  EEE      X    U   U  SSSSS"
+    echo "  N  NN  E       X X   U   U      S"
+    echo "  N   N  EEEEE  X   X   UUU   SSSSS"
+    echo -e "${NC}"
+
+    # 副标题（带行距）
+    echo -e "\n${CYAN}      ░N░E░X░U░S░ 节点管理控制台 v2.0${NC}"
+   echo -e "${BLUE}==============================================${NC}"
+
+    # 系统资源（严格对齐）
+    printf "${YELLOW}🖥️ 系统资源 ${BLUE}CPU:${GREEN}%-2d核 ${BLUE}内存:${GREEN}%-5s${NC}\n" \
+           $(nproc) $(free -h | awk '/Mem:/{print $4}')
+    echo -e "${BLUE}---------------------------------------${NC}"
+
+    # 节点表格（精确对齐）
+    printf "${CYAN}%-14s %-15s %-12s %-12s\n${NC}" "容器名称" "节点ID" "运行时间" "完成任务数"
+    echo -e "${BLUE}---------------------------------------${NC}"
+
+    while read -r name; do
+        node_id=$(docker inspect $name --format '{{.Config.Env}}' | grep -o 'NODE_ID=[0-9]*' | cut -d= -f2)
+        uptime=$(calculate_uptime "$name")
+        tasks=$(grep -c "Proof submitted" "/root/nexus-node/logs/nexus-${node_id}.log" 2>/dev/null || echo 0)
+
+        printf "${PURPLE}%-14s${NC} ${GREEN}%-11s${NC} ${YELLOW}%-9s${NC} ${RED}%-12s${NC}\n" \
+               "$name" "$node_id" "$uptime" "$tasks tasks"
+    done < <(docker ps --filter "name=nexus-node-" --format "{{.Names}}")
+
+    # 功能菜单（7个选项）
+    echo -e "${BLUE}==============================================${NC}"
+    echo -e "${CYAN}1. 构建镜像   2. 启动实例   3. 停止所有${NC}"
+    echo -e "${CYAN}4. 实时日志   5. 重启节点   6. 添加实例${NC}"
+    echo -e "${CYAN}7. 更新版本   0. 退出${NC}"
+    echo -e "${BLUE}==============================================${NC}"
 }
 
-# 启动菜单
-show_menu
+# ========== 主程序 ==========
+check_docker
+init_dirs
+
+while true; do
+    show_menu
+    read -rp "请选择操作: " choice
+    case "$choice" in
+        1) prepare_build_files; build_image;;
+        2) start_instances;;
+        3) docker rm -f $(docker ps -aq --filter "name=nexus-node-") 2>/dev/null || true;;
+        4) show_container_logs;;
+        5) restart_node;;
+        6) add_one_instance ;;
+        7) prepare_build_files; build_image_latest ;;
+        0) echo "退出"; exit 0;;
+        *) echo "无效选项";;
+    esac
+    read -rp "按 Enter 继续..."
+done
